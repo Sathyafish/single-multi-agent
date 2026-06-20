@@ -10,9 +10,13 @@ Compares a Single Agent vs Multi-Agent approach for fetching:
 Uses hosted open-source models (no local inference).
 
 Requirements:
-    pip install openai duckduckgo-search
+    pip install -r requirements.txt
 
 Usage (default — OpenRouter + Llama 3.3):
+    # Option 1: put OPENROUTER_API_KEY in .env (recommended)
+    python sf_zoo_agent_comparison.py
+
+    # Option 2: export in shell
     export OPENROUTER_API_KEY="your-key-here"
     python sf_zoo_agent_comparison.py
 
@@ -31,6 +35,12 @@ from typing import Optional
 from openai import OpenAI
 
 try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+try:
     from duckduckgo_search import DDGS
 except ImportError:
     DDGS = None
@@ -43,9 +53,8 @@ MAX_TOKENS = 1024
 
 # Default models per provider (override with LLM_MODEL env var)
 DEFAULT_MODELS = {
-    "groq": "groq/compound-mini",          # open models + built-in web search
     "openrouter": "meta-llama/llama-3.3-70b-instruct",
-    "together": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+    "groq": "groq/compound-mini",          # open models + built-in web search
 }
 
 MODEL = os.environ.get("LLM_MODEL", DEFAULT_MODELS.get(PROVIDER, DEFAULT_MODELS["openrouter"]))
@@ -54,20 +63,15 @@ MODEL = os.environ.get("LLM_MODEL", DEFAULT_MODELS.get(PROVIDER, DEFAULT_MODELS[
 COMPOUND_MODELS = {"groq/compound", "groq/compound-mini"}
 
 PROVIDER_CONFIG = {
-    "groq": {
-        "base_url": "https://api.groq.com/openai/v1",
-        "api_key_env": "GROQ_API_KEY",
-        "signup": "https://console.groq.com/",
-    },
     "openrouter": {
         "base_url": "https://openrouter.ai/api/v1",
         "api_key_env": "OPENROUTER_API_KEY",
         "signup": "https://openrouter.ai/",
     },
-    "together": {
-        "base_url": "https://api.together.xyz/v1",
-        "api_key_env": "TOGETHER_API_KEY",
-        "signup": "https://api.together.ai/",
+    "groq": {
+        "base_url": "https://api.groq.com/openai/v1",
+        "api_key_env": "GROQ_API_KEY",
+        "signup": "https://console.groq.com/",
     },
 }
 

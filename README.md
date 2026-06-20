@@ -24,7 +24,6 @@ These providers run open models in the cloud. You only need an API key.
 |----------|---------|----------|----------------------|-----------|
 | **[OpenRouter](https://openrouter.ai/)** ⭐ Default | [openrouter.ai](https://openrouter.ai/) | One API key, 300+ models | No (uses DuckDuckGo) | Limited free models |
 | **[Groq](https://console.groq.com/)** | [console.groq.com](https://console.groq.com/) | Fastest inference | Yes (`groq/compound-mini`) | Yes |
-| **[Together AI](https://www.together.ai/)** | [api.together.ai](https://api.together.ai/) | Llama, DeepSeek, Qwen hosting | No (uses DuckDuckGo) | $5 credit to start |
 
 ### Recommended models (all hosted, open-source)
 
@@ -36,7 +35,6 @@ These providers run open models in the cloud. You only need an API key.
 | Groq | `groq/compound-mini` | Built-in | Llama + gpt-oss with server-side search |
 | Groq | `groq/compound` | Built-in | More capable, higher cost |
 | Groq | `llama-3.3-70b-versatile` | DuckDuckGo | Fast raw Llama, no agent tools |
-| Together | `meta-llama/Llama-3.3-70B-Instruct-Turbo` | DuckDuckGo | Production Llama hosting |
 
 > **Why OpenRouter?** One API key gives access to 300+ hosted open models. The script fetches live web results via DuckDuckGo, then asks the model to answer from those results.
 
@@ -76,31 +74,41 @@ pip install -r requirements.txt
 
 ### Option A — OpenRouter (default)
 
+Create a `.env` file in the project root (already gitignored):
+
+```bash
+OPENROUTER_API_KEY=your-key-here
+GROQ_API_KEY=your-key-here
+LLM_PROVIDER=openrouter
+LLM_MODEL=meta-llama/llama-3.3-70b-instruct
+```
+
+Then run:
+
+```bash
+pip install -r requirements.txt
+python sf_zoo_agent_comparison.py
+```
+
+Or export in your shell instead:
+
 ```bash
 export OPENROUTER_API_KEY="your-key-here"
 python sf_zoo_agent_comparison.py
 ```
 
-Uses `meta-llama/llama-3.3-70b-instruct` by default. Override with `LLM_MODEL` if needed.
-
 ### Option B — Groq
 
+Add to `.env` or export in your shell:
+
 ```bash
-export LLM_PROVIDER=groq
-export GROQ_API_KEY="your-key-here"
+LLM_PROVIDER=groq
+GROQ_API_KEY=your-key-here
+LLM_MODEL=groq/compound-mini
 python sf_zoo_agent_comparison.py
 ```
 
-Uses `groq/compound-mini` (built-in web search).
-
-### Option C — Together AI
-
-```bash
-export LLM_PROVIDER=together
-export TOGETHER_API_KEY="your-key-here"
-export LLM_MODEL="meta-llama/Llama-3.3-70B-Instruct-Turbo"   # optional
-python sf_zoo_agent_comparison.py
-```
+Uses `groq/compound-mini` by default (built-in web search).
 
 ## Usage
 
@@ -139,11 +147,10 @@ Set via environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LLM_PROVIDER` | `openrouter` | `openrouter`, `groq`, or `together` |
+| `LLM_PROVIDER` | `openrouter` | `openrouter` or `groq` |
 | `LLM_MODEL` | Provider default | Model ID (see table above) |
 | `OPENROUTER_API_KEY` | — | Required when provider is `openrouter` |
 | `GROQ_API_KEY` | — | Required when provider is `groq` |
-| `TOGETHER_API_KEY` | — | Required when provider is `together` |
 
 Edit `TASKS` and `MAX_TOKENS` in `sf_zoo_agent_comparison.py` to customize prompts.
 
