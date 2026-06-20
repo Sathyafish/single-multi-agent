@@ -29,7 +29,8 @@ These providers run open models in the cloud. You only need an API key.
 
 | Provider | Model ID | Web search | Notes |
 |----------|----------|------------|-------|
-| OpenRouter | `meta-llama/llama-3.3-70b-instruct` | DuckDuckGo | **Default** — popular open Llama 3.3 |
+| OpenRouter | `meta-llama/llama-3.3-70b-instruct:free` | DuckDuckGo | **Default** — no credits needed |
+| OpenRouter | `meta-llama/llama-3.3-70b-instruct` | DuckDuckGo | Paid — requires credits |
 | OpenRouter | `deepseek/deepseek-chat-v3-0324` | DuckDuckGo | Strong reasoning, low cost |
 | OpenRouter | `qwen/qwen-2.5-72b-instruct` | DuckDuckGo | Good general-purpose model |
 | Groq | `groq/compound-mini` | Built-in | Llama + gpt-oss with server-side search |
@@ -72,43 +73,34 @@ flowchart TB
 pip install -r requirements.txt
 ```
 
-### Option A — OpenRouter (default)
+### Option A — Groq (recommended, free tier + built-in web search)
 
 Create a `.env` file in the project root (already gitignored):
 
 ```bash
-OPENROUTER_API_KEY=your-key-here
 GROQ_API_KEY=your-key-here
-LLM_PROVIDER=openrouter
-LLM_MODEL=meta-llama/llama-3.3-70b-instruct
+OPENROUTER_API_KEY=your-key-here
+LLM_PROVIDER=groq
+LLM_MODEL=groq/compound-mini
 ```
 
 Then run:
 
 ```bash
-pip install -r requirements.txt
 python sf_zoo_agent_comparison.py
 ```
 
-Or export in your shell instead:
+### Option B — OpenRouter (free model, no credits needed)
 
 ```bash
-export OPENROUTER_API_KEY="your-key-here"
+LLM_PROVIDER=openrouter
+LLM_MODEL=meta-llama/llama-3.3-70b-instruct:free
 python sf_zoo_agent_comparison.py
 ```
 
-### Option B — Groq
+> Paid OpenRouter models (without `:free`) require credits at [openrouter.ai/settings/credits](https://openrouter.ai/settings/credits).
 
-Add to `.env` or export in your shell:
-
-```bash
-LLM_PROVIDER=groq
-GROQ_API_KEY=your-key-here
-LLM_MODEL=groq/compound-mini
-python sf_zoo_agent_comparison.py
-```
-
-Uses `groq/compound-mini` by default (built-in web search).
+Change `LLM_PROVIDER` in `.env` to switch between Groq and OpenRouter.
 
 ## Usage
 
@@ -122,8 +114,8 @@ The script runs the single-agent flow first, then the multi-agent flow, and prin
 
 ```
 🦁  SF Zoo — Single Agent vs Multi-Agent Demo
-    Provider: openrouter  |  Model: meta-llama/llama-3.3-70b-instruct
-    Search:   DuckDuckGo + LLM
+    Provider: groq  |  Model: groq/compound-mini
+    Search:   built-in web search
     Tasks: weather · distance · tickets · hours
 
 ════════════════════════════════════════════════════════════
@@ -151,6 +143,7 @@ Set via environment variables:
 | `LLM_MODEL` | Provider default | Model ID (see table above) |
 | `OPENROUTER_API_KEY` | — | Required when provider is `openrouter` |
 | `GROQ_API_KEY` | — | Required when provider is `groq` |
+| `PAUSE_BETWEEN_RUNS_SEC` | `60` | Seconds to wait after single-agent run before multi-agent (helps Groq TPM limits; set `0` to skip) |
 
 Edit `TASKS` and `MAX_TOKENS` in `sf_zoo_agent_comparison.py` to customize prompts.
 
@@ -177,6 +170,8 @@ Edit `TASKS` and `MAX_TOKENS` in `sf_zoo_agent_comparison.py` to customize promp
 | **Cost** | Similar token usage | Similar; watch rate limits |
 
 Multi-agent wins on wall-clock time when tasks are independent and I/O-bound (web search). Single-agent is simpler and may be preferable when tasks depend on each other or when parallel API rate limits are a concern.
+
+**Groq rate limits:** The script pauses 60 seconds between the single-agent and multi-agent runs by default so token-per-minute (TPM) limits can reset. Set `PAUSE_BETWEEN_RUNS_SEC=0` in `.env` to disable.
 
 ## Project structure
 

@@ -41,19 +41,23 @@ except ImportError:
     pass
 
 try:
-    from duckduckgo_search import DDGS
+    from ddgs import DDGS
 except ImportError:
-    DDGS = None
+    try:
+        from duckduckgo_search import DDGS  # legacy package name
+    except ImportError:
+        DDGS = None
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 PROVIDER = os.environ.get("LLM_PROVIDER", "openrouter").lower()
 MAX_TOKENS = 1024
+PAUSE_BETWEEN_RUNS_SEC = int(os.environ.get("PAUSE_BETWEEN_RUNS_SEC", "60"))
 
 # Default models per provider (override with LLM_MODEL env var)
 DEFAULT_MODELS = {
-    "openrouter": "meta-llama/llama-3.3-70b-instruct",
+    "openrouter": "meta-llama/llama-3.3-70b-instruct:free",
     "groq": "groq/compound-mini",          # open models + built-in web search
 }
 
@@ -158,7 +162,7 @@ def uses_builtin_search() -> bool:
 def search_web(query: str, max_results: int = 5) -> str:
     """Fetch live web snippets via DuckDuckGo (free, no API key)."""
     if DDGS is None:
-        raise ImportError("pip install duckduckgo-search")
+        raise ImportError("pip install ddgs")
 
     snippets = []
     with DDGS() as ddgs:
@@ -206,7 +210,14 @@ def run_task(task: dict, client: OpenAI) -> TaskResult:
         answer, latency = call_model(prompt, client)
         return TaskResult(task["id"], task["label"], answer, latency)
     except Exception as exc:
-        return TaskResult(task["id"], task["label"], "", 0, error=str(exc))
+        msg = str(exc)
+        if "402" in msg and PROVIDER == "openrouter":
+            msg += (
+                "\n    Hint: use the free model (meta-llama/llama-3.3-70b-instruct:free), "
+                "add credits at https://openrouter.ai/settings/credits, "
+                "or switch to Groq (LLM_PROVIDER=groq)."
+            )
+        return TaskResult(task["id"], task["label"], "", 0, error=msg)
 
 
 # ── Single Agent ──────────────────────────────────────────────────────────────
@@ -323,6 +334,18 @@ def print_comparison(single: RunResult, multi: RunResult) -> None:
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def pause_between_runs(seconds: int) -> None:
+    """Wait between single- and multi-agent runs to avoid TPM rate limits."""
+    if seconds <= 0:
+        return
+    print(
+        f"\n  ⏳  Pausing {seconds}s between runs (rate-limit cooldown) …",
+        flush=True,
+    )
+    time.sleep(seconds)
+    print("  ✓  Cooldown complete — starting multi-agent run.\n", flush=True)
+
+
 def main():
     client = create_client()
     search_mode = "built-in web search" if uses_builtin_search() else "DuckDuckGo + LLM"
@@ -334,6 +357,8 @@ def main():
 
     single_result = run_single_agent(client)
     print_results(single_result)
+
+    pause_between_runs(PAUSE_BETWEEN_RUNS_SEC)
 
     multi_result = run_multi_agent(client)
     print_results(multi_result)
