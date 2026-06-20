@@ -79,7 +79,7 @@ Create a `.env` file in the project root (already gitignored):
 
 ```bash
 GROQ_API_KEY=your-key-here
-OPENROUTER_API_KEY=your-key-here
+GROQ_API_KEY_2=your-second-key-here
 LLM_PROVIDER=groq
 LLM_MODEL=groq/compound-mini
 ```
@@ -142,7 +142,8 @@ Set via environment variables:
 | `LLM_PROVIDER` | `openrouter` | `openrouter` or `groq` |
 | `LLM_MODEL` | Provider default | Model ID (see table above) |
 | `OPENROUTER_API_KEY` | — | Required when provider is `openrouter` |
-| `GROQ_API_KEY` | — | Required when provider is `groq` |
+| `GROQ_API_KEY` | — | Primary Groq key |
+| `GROQ_API_KEY_2` | — | Second Groq key (round-robin load balancing) |
 | `PAUSE_BETWEEN_RUNS_SEC` | `60` | Seconds to wait after single-agent run before multi-agent (helps Groq TPM limits; set `0` to skip) |
 | `SPLIT_MULTI_AGENT_MODELS` | `true` | Multi-agent uses a different model per task (separate TPM buckets on Groq) |
 | `MULTI_AGENT_STAGGER_SEC` | `3` | Delay between launching each parallel sub-agent |
@@ -175,6 +176,8 @@ Multi-agent wins on wall-clock time when tasks are independent and I/O-bound (we
 
 **Groq rate limits:** The script pauses 60 seconds between the single-agent and multi-agent runs by default so token-per-minute (TPM) limits can reset. Set `PAUSE_BETWEEN_RUNS_SEC=0` in `.env` to disable.
 
+**Multiple Groq keys:** Add `GROQ_API_KEY_2` (and `_3`, etc.) to `.env`. Tasks round-robin across keys — weather/hours use key #1, distance/tickets use key #2. On 429 errors, the script automatically retries with the other key.
+
 **Multi-agent model split (Groq):** Single-agent keeps `groq/compound-mini` (built-in web search). Multi-agent splits tasks across four lighter models — each with its own TPM bucket — plus DuckDuckGo search:
 
 | Task | Model |
@@ -185,6 +188,8 @@ Multi-agent wins on wall-clock time when tasks are independent and I/O-bound (we
 | Hours | `qwen/qwen3-32b` |
 
 This avoids hammering `gpt-oss-120b` (Compound's backend) and prevents 413 "request too large" errors from oversized Compound payloads.
+
+**DuckDuckGo + parallel agents:** Web searches run sequentially before multi-agent LLM calls (the `ddgs` library is not thread-safe and fails with SSL errors in parallel threads).
 
 ## Project structure
 

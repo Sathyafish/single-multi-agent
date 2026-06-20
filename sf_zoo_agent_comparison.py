@@ -28,6 +28,7 @@ Other providers:
 
 import os
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -150,6 +151,7 @@ class TaskResult:
     answer: str
     latency_ms: int
     model: str = ""
+    key_label: str = ""
     error: Optional[str] = None
 
 
@@ -162,19 +164,44 @@ class RunResult:
 
 # ── Client setup ──────────────────────────────────────────────────────────────
 
-def create_client() -> OpenAI:
+def load_api_keys() -> list[str]:
+    """Load one or more API keys (GROQ_API_KEY, GROQ_API_KEY_2, …)."""
+    cfg = PROVIDER_CONFIG[PROVIDER]
+    env = cfg["api_key_env"]
+    keys: list[str] = []
+
+    bulk = os.environ.get(f"{env}S")
+    if bulk:
+        keys.extend(k.strip() for k in bulk.split(",") if k.strip())
+
+    for name in [env] + [f"{env}_{i}" for i in range(2, 10)]:
+        value = os.environ.get(name)
+        if value and value not in keys:
+            keys.append(value)
+
+    return keys
+
+
+def create_clients() -> list[OpenAI]:
     if PROVIDER not in PROVIDER_CONFIG:
         supported = ", ".join(PROVIDER_CONFIG)
         raise ValueError(f"Unknown LLM_PROVIDER '{PROVIDER}'. Use one of: {supported}")
 
-    cfg = PROVIDER_CONFIG[PROVIDER]
-    api_key = os.environ.get(cfg["api_key_env"])
-    if not api_key:
+    keys = load_api_keys()
+    if not keys:
+        cfg = PROVIDER_CONFIG[PROVIDER]
         raise EnvironmentError(
             f"Set {cfg['api_key_env']} (sign up: {cfg['signup']})"
         )
 
-    return OpenAI(api_key=api_key, base_url=cfg["base_url"])
+    cfg = PROVIDER_CONFIG[PROVIDER]
+    return [OpenAI(api_key=key, base_url=cfg["base_url"]) for key in keys]
+
+
+def client_for_index(clients: list[OpenAI], idx: int) -> tuple[OpenAI, str]:
+    """Round-robin client selection across available API keys."""
+    slot = idx % len(clients)
+    return clients[slot], f"key #{slot + 1}"
 
 
 def model_uses_builtin_search(model: str) -> bool:
@@ -204,33 +231,79 @@ def parse_retry_seconds(error_msg: str) -> float:
 
 # ── Web search (for non-Compound models) ──────────────────────────────────────
 
+_search_lock = threading.Lock()
+
+
 def search_web(query: str, max_results: int = SEARCH_MAX_RESULTS) -> str:
     """Fetch live web snippets via DuckDuckGo (free, no API key)."""
     if DDGS is None:
         raise ImportError("pip install ddgs")
 
     snippets = []
-    with DDGS() as ddgs:
-        for hit in ddgs.text(query, max_results=max_results):
-            title = hit.get("title", "")
-            body = hit.get("body", "")[:SEARCH_SNIPPET_CHARS]
-            url = hit.get("href", "")
-            snippets.append(f"- {title}: {body} ({url})")
+    # DDGS is not thread-safe — serialize all search calls
+    with _search_lock:
+        with DDGS() as ddgs:
+            for hit in ddgs.text(query, max_results=max_results):
+                title = hit.get("title", "")
+                body = hit.get("body", "")[:SEARCH_SNIPPET_CHARS]
+                url = hit.get("href", "")
+                snippets.append(f"- {title}: {body} ({url})")
 
     return "\n".join(snippets) if snippets else "(no search results)"
 
 
-def build_prompt(task_prompt: str, model: str) -> str:
-    if model_uses_builtin_search(model):
-        return task_prompt
-
-    search_results = search_web(task_prompt)
+def format_search_prompt(task_prompt: str, search_results: str) -> str:
     return (
         "Use the web search results below to answer the question. "
         "Be concise (2-3 sentences). If results are insufficient, say what is missing.\n\n"
         f"Web search results:\n{search_results}\n\n"
         f"Question: {task_prompt}"
     )
+
+
+def build_prompt(
+    task_prompt: str,
+    model: str,
+    search_results: Optional[str] = None,
+) -> str:
+    if model_uses_builtin_search(model):
+        return task_prompt
+
+    if search_results is None:
+        search_results = search_web(task_prompt)
+    return format_search_prompt(task_prompt, search_results)
+
+
+def prefetch_prompts(tasks: list[dict], models: list[str]) -> dict[str, Optional[str]]:
+    """
+    Run all DuckDuckGo searches sequentially before parallel LLM calls.
+    Avoids SSL/thread errors (e.g. 'Unsupported protocol version 0x304').
+    """
+    cache: dict[str, Optional[str]] = {}
+    needs_search = any(
+        not model_uses_builtin_search(model) for model in models
+    )
+    if not needs_search:
+        for task in tasks:
+            cache[task["id"]] = task["prompt"]
+        return cache
+
+    print("\n  Prefetching web searches (sequential) …")
+    for task, model in zip(tasks, models):
+        if model_uses_builtin_search(model):
+            cache[task["id"]] = task["prompt"]
+            continue
+        print(f"    → {task['label']} …", end="", flush=True)
+        try:
+            results = search_web(task["prompt"])
+            cache[task["id"]] = format_search_prompt(task["prompt"], results)
+            print(" ✓")
+        except Exception as exc:
+            cache[task["id"]] = None
+            print(f" ✗ {exc}")
+        time.sleep(0.5)
+
+    return cache
 
 
 # ── Core API call ─────────────────────────────────────────────────────────────
@@ -250,16 +323,26 @@ def call_model(prompt: str, client: OpenAI, model: str) -> tuple[str, int]:
 
 
 def call_model_with_retry(
-    prompt: str, client: OpenAI, model: str, max_attempts: int = 3
-) -> tuple[str, int]:
+    prompt: str,
+    clients: list[OpenAI],
+    model: str,
+    client_idx: int,
+    max_attempts: int = 3,
+) -> tuple[str, int, int]:
+    """Returns (answer, latency_ms, client_slot_used)."""
     last_exc: Optional[Exception] = None
+    slot = client_idx % len(clients)
+
     for attempt in range(max_attempts):
         try:
-            return call_model(prompt, client, model)
+            answer, latency = call_model(prompt, clients[slot], model)
+            return answer, latency, slot
         except Exception as exc:
             last_exc = exc
             msg = str(exc)
             if "429" in msg and attempt < max_attempts - 1:
+                if len(clients) > 1:
+                    slot = (slot + 1) % len(clients)
                 wait = parse_retry_seconds(msg)
                 time.sleep(wait)
                 continue
@@ -267,11 +350,38 @@ def call_model_with_retry(
     raise last_exc  # type: ignore[misc]
 
 
-def run_task(task: dict, client: OpenAI, model: str) -> TaskResult:
+def run_task(
+    task: dict,
+    clients: list[OpenAI],
+    model: str,
+    client_idx: int,
+    prebuilt_prompt: Optional[str] = None,
+    search_failed: bool = False,
+) -> TaskResult:
+    _, key_label = client_for_index(clients, client_idx)
     try:
-        prompt = build_prompt(task["prompt"], model)
-        answer, latency = call_model_with_retry(prompt, client, model)
-        return TaskResult(task["id"], task["label"], answer, latency, model=model)
+        if search_failed:
+            return TaskResult(
+                task["id"],
+                task["label"],
+                "",
+                0,
+                model=model,
+                key_label=key_label,
+                error="Web search failed during prefetch",
+            )
+        if prebuilt_prompt is None:
+            prompt = build_prompt(task["prompt"], model)
+        else:
+            prompt = prebuilt_prompt
+
+        answer, latency, slot = call_model_with_retry(
+            prompt, clients, model, client_idx
+        )
+        key_label = f"key #{slot + 1}"
+        return TaskResult(
+            task["id"], task["label"], answer, latency, model=model, key_label=key_label
+        )
     except Exception as exc:
         msg = str(exc)
         if "402" in msg and PROVIDER == "openrouter":
@@ -285,26 +395,31 @@ def run_task(task: dict, client: OpenAI, model: str) -> TaskResult:
                 "\n    Hint: request too large — multi-agent now uses smaller "
                 "DuckDuckGo prompts and split models to avoid this."
             )
-        return TaskResult(task["id"], task["label"], "", 0, model=model, error=msg)
+        return TaskResult(
+            task["id"], task["label"], "", 0, model=model, key_label=key_label, error=msg
+        )
 
 
 # ── Single Agent ──────────────────────────────────────────────────────────────
 
-def run_single_agent(client: OpenAI) -> RunResult:
+def run_single_agent(clients: list[OpenAI]) -> RunResult:
     """
     One agent handles all four tasks sequentially.
-    Each task is a separate API call resolved one by one.
+    Tasks alternate across API keys when multiple keys are configured.
     """
     print("\n" + "═" * 60)
     print("  SINGLE AGENT  (sequential)")
     print("═" * 60)
+    if len(clients) > 1:
+        print(f"\n  API keys: {len(clients)} (round-robin per task)")
 
     run_start = time.perf_counter()
     task_results = []
 
-    for task in TASKS:
-        print(f"\n  → {task['label']} …", end="", flush=True)
-        result = run_task(task, client, MODEL)
+    for idx, task in enumerate(TASKS):
+        _, key_label = client_for_index(clients, idx)
+        print(f"\n  → {task['label']} [{key_label}] …", end="", flush=True)
+        result = run_task(task, clients, MODEL, idx)
         task_results.append(result)
         if result.error:
             print(f" ✗ ERROR: {result.error}")
@@ -317,10 +432,10 @@ def run_single_agent(client: OpenAI) -> RunResult:
 
 # ── Multi-Agent ───────────────────────────────────────────────────────────────
 
-def run_multi_agent(client: OpenAI) -> RunResult:
+def run_multi_agent(clients: list[OpenAI]) -> RunResult:
     """
     Four specialized sub-agents run in parallel, each on a different model
-    (separate TPM buckets) with staggered launches to reduce rate-limit spikes.
+    and API key (separate TPM buckets) with staggered launches.
     """
     models = get_multi_agent_models()
 
@@ -328,13 +443,19 @@ def run_multi_agent(client: OpenAI) -> RunResult:
     print("  MULTI-AGENT  (parallel, 4 sub-agents)")
     print("═" * 60)
 
+    if len(clients) > 1:
+        print(f"\n  API keys: {len(clients)} (round-robin per task)")
+
     if SPLIT_MULTI_AGENT_MODELS and len(set(models)) > 1:
-        print("\n  Model split (one model per task):")
-        for task, model in zip(TASKS, models):
-            print(f"    {task['label']:<30} → {model}")
+        print("\n  Model + key split (one per task):")
+        for idx, (task, model) in enumerate(zip(TASKS, models)):
+            _, key_label = client_for_index(clients, idx)
+            print(f"    {task['label']:<30} → {model}  ({key_label})")
         print(f"\n  Staggered launch: {MULTI_AGENT_STAGGER_SEC}s between agents\n")
     else:
         print("\n  Launching all agents simultaneously …\n")
+
+    prompt_cache = prefetch_prompts(TASKS, models)
 
     run_start = time.perf_counter()
     task_results: list[TaskResult] = [None] * len(TASKS)
@@ -344,7 +465,17 @@ def run_multi_agent(client: OpenAI) -> RunResult:
         for idx, task in enumerate(TASKS):
             if idx > 0 and MULTI_AGENT_STAGGER_SEC > 0:
                 time.sleep(MULTI_AGENT_STAGGER_SEC)
-            future = executor.submit(run_task, task, client, models[idx])
+            cached = prompt_cache.get(task["id"])
+            future = executor.submit(
+                run_task,
+                task,
+                clients,
+                models[idx],
+                idx,
+                cached if cached is not None else None,
+                search_failed=cached is None
+                and not model_uses_builtin_search(models[idx]),
+            )
             future_to_index[future] = idx
 
         for future in as_completed(future_to_index):
@@ -353,8 +484,9 @@ def run_multi_agent(client: OpenAI) -> RunResult:
             task_results[idx] = result
             status = "✓" if not result.error else "✗"
             model_tag = f" [{result.model}]" if result.model else ""
+            key_tag = f" ({result.key_label})" if result.key_label else ""
             print(
-                f"  {status} [{result.latency_ms:>5} ms]{model_tag}  {result.label}"
+                f"  {status} [{result.latency_ms:>5} ms]{model_tag}{key_tag}  {result.label}"
             )
 
     total_ms = int((time.perf_counter() - run_start) * 1000)
@@ -385,6 +517,8 @@ def print_results(result: RunResult) -> None:
             print("\n".join(lines))
         if r.model:
             print(f"    🤖  {r.model}")
+        if r.key_label:
+            print(f"    🔑  {r.key_label}")
         print(f"    ⏱  {r.latency_ms} ms")
 
 
@@ -432,7 +566,7 @@ def pause_between_runs(seconds: int) -> None:
 
 
 def main():
-    client = create_client()
+    clients = create_clients()
     search_mode = (
         "built-in web search"
         if uses_builtin_search()
@@ -442,6 +576,8 @@ def main():
 
     print("\n🦁  SF Zoo — Single Agent vs Multi-Agent Demo")
     print(f"    Provider: {PROVIDER}  |  Single model: {MODEL}")
+    if len(clients) > 1:
+        print(f"    API keys:  {len(clients)} Groq keys (load-balanced)")
     if SPLIT_MULTI_AGENT_MODELS and len(set(multi_models)) > 1:
         print(f"    Multi:    split across {len(set(multi_models))} models")
     else:
@@ -449,12 +585,12 @@ def main():
     print(f"    Search:   {search_mode}")
     print("    Tasks: weather · distance · tickets · hours\n")
 
-    single_result = run_single_agent(client)
+    single_result = run_single_agent(clients)
     print_results(single_result)
 
     pause_between_runs(PAUSE_BETWEEN_RUNS_SEC)
 
-    multi_result = run_multi_agent(client)
+    multi_result = run_multi_agent(clients)
     print_results(multi_result)
 
     print_comparison(single_result, multi_result)
