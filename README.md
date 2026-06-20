@@ -144,6 +144,8 @@ Set via environment variables:
 | `OPENROUTER_API_KEY` | — | Required when provider is `openrouter` |
 | `GROQ_API_KEY` | — | Required when provider is `groq` |
 | `PAUSE_BETWEEN_RUNS_SEC` | `60` | Seconds to wait after single-agent run before multi-agent (helps Groq TPM limits; set `0` to skip) |
+| `SPLIT_MULTI_AGENT_MODELS` | `true` | Multi-agent uses a different model per task (separate TPM buckets on Groq) |
+| `MULTI_AGENT_STAGGER_SEC` | `3` | Delay between launching each parallel sub-agent |
 
 Edit `TASKS` and `MAX_TOKENS` in `sf_zoo_agent_comparison.py` to customize prompts.
 
@@ -172,6 +174,17 @@ Edit `TASKS` and `MAX_TOKENS` in `sf_zoo_agent_comparison.py` to customize promp
 Multi-agent wins on wall-clock time when tasks are independent and I/O-bound (web search). Single-agent is simpler and may be preferable when tasks depend on each other or when parallel API rate limits are a concern.
 
 **Groq rate limits:** The script pauses 60 seconds between the single-agent and multi-agent runs by default so token-per-minute (TPM) limits can reset. Set `PAUSE_BETWEEN_RUNS_SEC=0` in `.env` to disable.
+
+**Multi-agent model split (Groq):** Single-agent keeps `groq/compound-mini` (built-in web search). Multi-agent splits tasks across four lighter models — each with its own TPM bucket — plus DuckDuckGo search:
+
+| Task | Model |
+|------|-------|
+| Weather | `llama-3.1-8b-instant` |
+| Distance | `gemma2-9b-it` |
+| Tickets | `llama-3.3-70b-versatile` |
+| Hours | `qwen/qwen3-32b` |
+
+This avoids hammering `gpt-oss-120b` (Compound's backend) and prevents 413 "request too large" errors from oversized Compound payloads.
 
 ## Project structure
 

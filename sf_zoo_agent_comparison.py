@@ -27,6 +27,7 @@ Other providers:
 """
 
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -54,6 +55,12 @@ except ImportError:
 PROVIDER = os.environ.get("LLM_PROVIDER", "openrouter").lower()
 MAX_TOKENS = 1024
 PAUSE_BETWEEN_RUNS_SEC = int(os.environ.get("PAUSE_BETWEEN_RUNS_SEC", "60"))
+MULTI_AGENT_STAGGER_SEC = float(os.environ.get("MULTI_AGENT_STAGGER_SEC", "3"))
+SEARCH_MAX_RESULTS = int(os.environ.get("SEARCH_MAX_RESULTS", "3"))
+SEARCH_SNIPPET_CHARS = int(os.environ.get("SEARCH_SNIPPET_CHARS", "280"))
+SPLIT_MULTI_AGENT_MODELS = os.environ.get(
+    "SPLIT_MULTI_AGENT_MODELS", "true"
+).lower() in {"1", "true", "yes"}
 
 # Default models per provider (override with LLM_MODEL env var)
 DEFAULT_MODELS = {
@@ -65,6 +72,22 @@ MODEL = os.environ.get("LLM_MODEL", DEFAULT_MODELS.get(PROVIDER, DEFAULT_MODELS[
 
 # Models with server-side web search (no DuckDuckGo needed)
 COMPOUND_MODELS = {"groq/compound", "groq/compound-mini"}
+
+# One model per sub-agent — separate TPM buckets on Groq (avoids 429/413)
+MULTI_AGENT_MODEL_POOLS = {
+    "groq": [
+        "llama-3.1-8b-instant",
+        "gemma2-9b-it",
+        "llama-3.3-70b-versatile",
+        "qwen/qwen3-32b",
+    ],
+    "openrouter": [
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "deepseek/deepseek-chat-v3-0324:free",
+        "meta-llama/llama-3.2-3b-instruct:free",
+        "meta-llama/llama-3.3-70b-instruct:free",
+    ],
+}
 
 PROVIDER_CONFIG = {
     "openrouter": {
@@ -126,6 +149,7 @@ class TaskResult:
     label: str
     answer: str
     latency_ms: int
+    model: str = ""
     error: Optional[str] = None
 
 
@@ -153,13 +177,34 @@ def create_client() -> OpenAI:
     return OpenAI(api_key=api_key, base_url=cfg["base_url"])
 
 
+def model_uses_builtin_search(model: str) -> bool:
+    return model in COMPOUND_MODELS
+
+
 def uses_builtin_search() -> bool:
-    return MODEL in COMPOUND_MODELS
+    return model_uses_builtin_search(MODEL)
+
+
+def get_multi_agent_models() -> list[str]:
+    """Assign a different model to each parallel sub-agent."""
+    if not SPLIT_MULTI_AGENT_MODELS:
+        return [MODEL] * len(TASKS)
+
+    pool = MULTI_AGENT_MODEL_POOLS.get(PROVIDER)
+    if not pool:
+        return [MODEL] * len(TASKS)
+
+    return [pool[idx % len(pool)] for idx in range(len(TASKS))]
+
+
+def parse_retry_seconds(error_msg: str) -> float:
+    match = re.search(r"try again in ([\d.]+)s", error_msg, re.IGNORECASE)
+    return float(match.group(1)) + 1.0 if match else 5.0
 
 
 # ── Web search (for non-Compound models) ──────────────────────────────────────
 
-def search_web(query: str, max_results: int = 5) -> str:
+def search_web(query: str, max_results: int = SEARCH_MAX_RESULTS) -> str:
     """Fetch live web snippets via DuckDuckGo (free, no API key)."""
     if DDGS is None:
         raise ImportError("pip install ddgs")
@@ -168,21 +213,21 @@ def search_web(query: str, max_results: int = 5) -> str:
     with DDGS() as ddgs:
         for hit in ddgs.text(query, max_results=max_results):
             title = hit.get("title", "")
-            body = hit.get("body", "")
+            body = hit.get("body", "")[:SEARCH_SNIPPET_CHARS]
             url = hit.get("href", "")
             snippets.append(f"- {title}: {body} ({url})")
 
     return "\n".join(snippets) if snippets else "(no search results)"
 
 
-def build_prompt(task_prompt: str) -> str:
-    if uses_builtin_search():
+def build_prompt(task_prompt: str, model: str) -> str:
+    if model_uses_builtin_search(model):
         return task_prompt
 
     search_results = search_web(task_prompt)
     return (
         "Use the web search results below to answer the question. "
-        "If results are insufficient, say what is missing.\n\n"
+        "Be concise (2-3 sentences). If results are insufficient, say what is missing.\n\n"
         f"Web search results:\n{search_results}\n\n"
         f"Question: {task_prompt}"
     )
@@ -190,11 +235,11 @@ def build_prompt(task_prompt: str) -> str:
 
 # ── Core API call ─────────────────────────────────────────────────────────────
 
-def call_model(prompt: str, client: OpenAI) -> tuple[str, int]:
+def call_model(prompt: str, client: OpenAI, model: str) -> tuple[str, int]:
     """Call hosted open-source model and return (answer_text, latency_ms)."""
     start = time.perf_counter()
     response = client.chat.completions.create(
-        model=MODEL,
+        model=model,
         max_tokens=MAX_TOKENS,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -204,11 +249,29 @@ def call_model(prompt: str, client: OpenAI) -> tuple[str, int]:
     return answer or "(no text response)", elapsed_ms
 
 
-def run_task(task: dict, client: OpenAI) -> TaskResult:
+def call_model_with_retry(
+    prompt: str, client: OpenAI, model: str, max_attempts: int = 3
+) -> tuple[str, int]:
+    last_exc: Optional[Exception] = None
+    for attempt in range(max_attempts):
+        try:
+            return call_model(prompt, client, model)
+        except Exception as exc:
+            last_exc = exc
+            msg = str(exc)
+            if "429" in msg and attempt < max_attempts - 1:
+                wait = parse_retry_seconds(msg)
+                time.sleep(wait)
+                continue
+            raise
+    raise last_exc  # type: ignore[misc]
+
+
+def run_task(task: dict, client: OpenAI, model: str) -> TaskResult:
     try:
-        prompt = build_prompt(task["prompt"])
-        answer, latency = call_model(prompt, client)
-        return TaskResult(task["id"], task["label"], answer, latency)
+        prompt = build_prompt(task["prompt"], model)
+        answer, latency = call_model_with_retry(prompt, client, model)
+        return TaskResult(task["id"], task["label"], answer, latency, model=model)
     except Exception as exc:
         msg = str(exc)
         if "402" in msg and PROVIDER == "openrouter":
@@ -217,7 +280,12 @@ def run_task(task: dict, client: OpenAI) -> TaskResult:
                 "add credits at https://openrouter.ai/settings/credits, "
                 "or switch to Groq (LLM_PROVIDER=groq)."
             )
-        return TaskResult(task["id"], task["label"], "", 0, error=msg)
+        if "413" in msg:
+            msg += (
+                "\n    Hint: request too large — multi-agent now uses smaller "
+                "DuckDuckGo prompts and split models to avoid this."
+            )
+        return TaskResult(task["id"], task["label"], "", 0, model=model, error=msg)
 
 
 # ── Single Agent ──────────────────────────────────────────────────────────────
@@ -236,7 +304,7 @@ def run_single_agent(client: OpenAI) -> RunResult:
 
     for task in TASKS:
         print(f"\n  → {task['label']} …", end="", flush=True)
-        result = run_task(task, client)
+        result = run_task(task, client, MODEL)
         task_results.append(result)
         if result.error:
             print(f" ✗ ERROR: {result.error}")
@@ -251,28 +319,43 @@ def run_single_agent(client: OpenAI) -> RunResult:
 
 def run_multi_agent(client: OpenAI) -> RunResult:
     """
-    Four specialized sub-agents run in parallel using a thread pool.
-    Total latency ≈ slowest single task, not the sum.
+    Four specialized sub-agents run in parallel, each on a different model
+    (separate TPM buckets) with staggered launches to reduce rate-limit spikes.
     """
+    models = get_multi_agent_models()
+
     print("\n" + "═" * 60)
     print("  MULTI-AGENT  (parallel, 4 sub-agents)")
     print("═" * 60)
-    print("\n  Launching all agents simultaneously …\n")
+
+    if SPLIT_MULTI_AGENT_MODELS and len(set(models)) > 1:
+        print("\n  Model split (one model per task):")
+        for task, model in zip(TASKS, models):
+            print(f"    {task['label']:<30} → {model}")
+        print(f"\n  Staggered launch: {MULTI_AGENT_STAGGER_SEC}s between agents\n")
+    else:
+        print("\n  Launching all agents simultaneously …\n")
 
     run_start = time.perf_counter()
     task_results: list[TaskResult] = [None] * len(TASKS)
 
     with ThreadPoolExecutor(max_workers=len(TASKS)) as executor:
-        future_to_index = {
-            executor.submit(run_task, task, client): idx
-            for idx, task in enumerate(TASKS)
-        }
+        future_to_index = {}
+        for idx, task in enumerate(TASKS):
+            if idx > 0 and MULTI_AGENT_STAGGER_SEC > 0:
+                time.sleep(MULTI_AGENT_STAGGER_SEC)
+            future = executor.submit(run_task, task, client, models[idx])
+            future_to_index[future] = idx
+
         for future in as_completed(future_to_index):
             idx = future_to_index[future]
             result = future.result()
             task_results[idx] = result
             status = "✓" if not result.error else "✗"
-            print(f"  {status} [{result.latency_ms:>5} ms]  {result.label}")
+            model_tag = f" [{result.model}]" if result.model else ""
+            print(
+                f"  {status} [{result.latency_ms:>5} ms]{model_tag}  {result.label}"
+            )
 
     total_ms = int((time.perf_counter() - run_start) * 1000)
     return RunResult("multi", total_ms, task_results)
@@ -300,6 +383,8 @@ def print_results(result: RunResult) -> None:
             if line:
                 lines.append("    " + " ".join(line))
             print("\n".join(lines))
+        if r.model:
+            print(f"    🤖  {r.model}")
         print(f"    ⏱  {r.latency_ms} ms")
 
 
@@ -348,10 +433,19 @@ def pause_between_runs(seconds: int) -> None:
 
 def main():
     client = create_client()
-    search_mode = "built-in web search" if uses_builtin_search() else "DuckDuckGo + LLM"
+    search_mode = (
+        "built-in web search"
+        if uses_builtin_search()
+        else "DuckDuckGo + LLM"
+    )
+    multi_models = get_multi_agent_models()
 
     print("\n🦁  SF Zoo — Single Agent vs Multi-Agent Demo")
-    print(f"    Provider: {PROVIDER}  |  Model: {MODEL}")
+    print(f"    Provider: {PROVIDER}  |  Single model: {MODEL}")
+    if SPLIT_MULTI_AGENT_MODELS and len(set(multi_models)) > 1:
+        print(f"    Multi:    split across {len(set(multi_models))} models")
+    else:
+        print(f"    Multi:    {MODEL}")
     print(f"    Search:   {search_mode}")
     print("    Tasks: weather · distance · tickets · hours\n")
 
