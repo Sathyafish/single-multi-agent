@@ -2,10 +2,10 @@
 
 A Python demo that compares two agent architectures for gathering real-time information about the [San Francisco Zoo](https://www.sfzoo.org/):
 
-- **Single agent** — one Claude instance handles four tasks sequentially
+- **Single agent** — one model handles four tasks sequentially
 - **Multi-agent** — four specialized sub-agents run in parallel, each focused on one task
 
-Both approaches use Claude with web search to fetch live data. The script measures latency per task and overall, then prints a side-by-side comparison.
+Both approaches use **hosted open-source models** over the internet (no local GPU or model download). The script measures latency per task and overall, then prints a side-by-side comparison.
 
 ## Tasks
 
@@ -15,6 +15,30 @@ Both approaches use Claude with web search to fetch live data. The script measur
 | Distance | Driving distance and time from Union Square to the zoo |
 | Tickets | Adult general admission price (USD) |
 | Hours | Today's opening hours and seasonal notes |
+
+## Hosted open-source providers (no local inference)
+
+These providers run open models in the cloud. You only need an API key.
+
+| Provider | Sign up | Best for | Built-in web search? | Free tier |
+|----------|---------|----------|----------------------|-----------|
+| **[OpenRouter](https://openrouter.ai/)** ⭐ Default | [openrouter.ai](https://openrouter.ai/) | One API key, 300+ models | No (uses DuckDuckGo) | Limited free models |
+| **[Groq](https://console.groq.com/)** | [console.groq.com](https://console.groq.com/) | Fastest inference | Yes (`groq/compound-mini`) | Yes |
+| **[Together AI](https://www.together.ai/)** | [api.together.ai](https://api.together.ai/) | Llama, DeepSeek, Qwen hosting | No (uses DuckDuckGo) | $5 credit to start |
+
+### Recommended models (all hosted, open-source)
+
+| Provider | Model ID | Web search | Notes |
+|----------|----------|------------|-------|
+| OpenRouter | `meta-llama/llama-3.3-70b-instruct` | DuckDuckGo | **Default** — popular open Llama 3.3 |
+| OpenRouter | `deepseek/deepseek-chat-v3-0324` | DuckDuckGo | Strong reasoning, low cost |
+| OpenRouter | `qwen/qwen-2.5-72b-instruct` | DuckDuckGo | Good general-purpose model |
+| Groq | `groq/compound-mini` | Built-in | Llama + gpt-oss with server-side search |
+| Groq | `groq/compound` | Built-in | More capable, higher cost |
+| Groq | `llama-3.3-70b-versatile` | DuckDuckGo | Fast raw Llama, no agent tools |
+| Together | `meta-llama/Llama-3.3-70B-Instruct-Turbo` | DuckDuckGo | Production Llama hosting |
+
+> **Why OpenRouter?** One API key gives access to 300+ hosted open models. The script fetches live web results via DuckDuckGo, then asks the model to answer from those results.
 
 ## Architecture
 
@@ -42,25 +66,43 @@ flowchart TB
 ## Prerequisites
 
 - Python 3.10+
-- An [Anthropic API key](https://console.anthropic.com/) with access to Claude and the web search tool
+- API key from one of the providers above
 
 ## Setup
 
 ```bash
-pip install anthropic
+pip install -r requirements.txt
 ```
 
-Set your API key:
+### Option A — OpenRouter (default)
 
 ```bash
-export ANTHROPIC_API_KEY="your-key-here"
+export OPENROUTER_API_KEY="your-key-here"
+python sf_zoo_agent_comparison.py
+```
+
+Uses `meta-llama/llama-3.3-70b-instruct` by default. Override with `LLM_MODEL` if needed.
+
+### Option B — Groq
+
+```bash
+export LLM_PROVIDER=groq
+export GROQ_API_KEY="your-key-here"
+python sf_zoo_agent_comparison.py
+```
+
+Uses `groq/compound-mini` (built-in web search).
+
+### Option C — Together AI
+
+```bash
+export LLM_PROVIDER=together
+export TOGETHER_API_KEY="your-key-here"
+export LLM_MODEL="meta-llama/Llama-3.3-70B-Instruct-Turbo"   # optional
+python sf_zoo_agent_comparison.py
 ```
 
 ## Usage
-
-```bash
-python sf_zoo_agent_comparison.py
-```
 
 The script runs the single-agent flow first, then the multi-agent flow, and prints:
 
@@ -72,6 +114,8 @@ The script runs the single-agent flow first, then the multi-agent flow, and prin
 
 ```
 🦁  SF Zoo — Single Agent vs Multi-Agent Demo
+    Provider: openrouter  |  Model: meta-llama/llama-3.3-70b-instruct
+    Search:   DuckDuckGo + LLM
     Tasks: weather · distance · tickets · hours
 
 ════════════════════════════════════════════════════════════
@@ -83,41 +127,37 @@ The script runs the single-agent flow first, then the multi-agent flow, and prin
   ...
 
 ════════════════════════════════════════════════════════════
-  MULTI-AGENT  (parallel, 4 sub-agents)
-════════════════════════════════════════════════════════════
-
-  ✓ [4100 ms]  🌤  Weather at SF Zoo
-  ✓ [3900 ms]  📍 Distance from downtown SF
-  ...
-
-════════════════════════════════════════════════════════════
   COMPARISON SUMMARY
 ════════════════════════════════════════════════════════════
-  Metric                             Single      Multi
-  ──────────────────────────────────────────────────
   Total latency                      15200ms     4200ms
   Speed advantage                         —      3.6×
 ```
 
 ## Configuration
 
-Edit constants at the top of `sf_zoo_agent_comparison.py`:
+Set via environment variables:
 
-| Constant | Default | Description |
+| Variable | Default | Description |
 |----------|---------|-------------|
-| `MODEL` | `claude-sonnet-4-6` | Claude model used for all calls |
-| `MAX_TOKENS` | `1024` | Max tokens per response |
-| `TASKS` | 4 zoo-related prompts | Task definitions (id, label, prompt) |
+| `LLM_PROVIDER` | `openrouter` | `openrouter`, `groq`, or `together` |
+| `LLM_MODEL` | Provider default | Model ID (see table above) |
+| `OPENROUTER_API_KEY` | — | Required when provider is `openrouter` |
+| `GROQ_API_KEY` | — | Required when provider is `groq` |
+| `TOGETHER_API_KEY` | — | Required when provider is `together` |
+
+Edit `TASKS` and `MAX_TOKENS` in `sf_zoo_agent_comparison.py` to customize prompts.
 
 ## How it works
 
-1. **`call_claude`** — Sends a prompt to Claude with the `web_search` tool enabled and returns the text answer plus latency in milliseconds.
+1. **`create_client`** — Builds an OpenAI-compatible client for the chosen provider.
 
-2. **`run_single_agent`** — Loops through `TASKS` and calls Claude once per task, sequentially.
+2. **`build_prompt`** — For Compound models, sends the task directly (search runs server-side). For other models, fetches DuckDuckGo results and injects them into the prompt.
 
-3. **`run_multi_agent`** — Submits each task to a thread pool worker (`_run_task`). Results are collected as futures complete and reordered to match the original task list.
+3. **`run_single_agent`** — Loops through `TASKS` sequentially.
 
-4. **`print_comparison`** — Computes speedup (`single_total / multi_total`) and prints per-task latency winners.
+4. **`run_multi_agent`** — Runs all four tasks in parallel via a thread pool.
+
+5. **`print_comparison`** — Computes speedup and prints per-task winners.
 
 ## Trade-offs
 
@@ -127,16 +167,17 @@ Edit constants at the top of `sf_zoo_agent_comparison.py`:
 | **API calls** | Same (4 calls) | Same (4 calls) |
 | **Context focus** | One agent, many tasks | One task per agent |
 | **Complexity** | Simpler orchestration | Thread pool + result merging |
-| **Cost** | Similar token usage | Similar token usage; may run concurrently |
+| **Cost** | Similar token usage | Similar; watch rate limits |
 
-Multi-agent wins on wall-clock time when tasks are independent and I/O-bound (web search). Single-agent is simpler to reason about and may be preferable when tasks depend on each other or when parallel API rate limits are a concern.
+Multi-agent wins on wall-clock time when tasks are independent and I/O-bound (web search). Single-agent is simpler and may be preferable when tasks depend on each other or when parallel API rate limits are a concern.
 
 ## Project structure
 
 ```
 single-multi-agent/
 ├── README.md
-└── sf_zoo_agent_comparison.py   # Demo script (config, agents, comparison)
+├── requirements.txt
+└── sf_zoo_agent_comparison.py
 ```
 
 ## License
